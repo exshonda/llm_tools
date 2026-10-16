@@ -94,10 +94,18 @@ CACHE_WRITE_5M_MULTIPLIER = 1.25
 CACHE_WRITE_1H_MULTIPLIER = 2.0
 
 
+COST_KEYS = ("input", "output", "cache_write", "cache_read")
+
+
 def calc_message_cost(model: str, usage: dict):
-    """1 API 応答の API 単価換算コスト (USD) を返す。単価不明なら None"""
+    """1 API 応答の API 単価換算コスト (USD) を種別ごとに返す。
+
+    戻り値: {"input", "output", "cache_write", "cache_read"} → USD。単価不明なら None
+    """
+    zero = dict.fromkeys(COST_KEYS, 0.0)
     if not isinstance(usage, dict):
-        return 0.0
+        return zero
+
     def tok(d, k):
         v = d.get(k) if isinstance(d, dict) else None
         return int(v) if isinstance(v, (int, float)) else 0
@@ -108,7 +116,7 @@ def calc_message_cost(model: str, usage: dict):
     write_t = tok(usage, "cache_creation_input_tokens")
     # トークン 0 の応答 (Claude Code の <synthetic> 等) は単価に関係なく 0
     if in_t + out_t + read_t + write_t == 0:
-        return 0.0
+        return zero
 
     short = shorten_model_name(model)
     price = MODEL_PRICING.get(short)
@@ -133,14 +141,14 @@ def calc_message_cost(model: str, usage: dict):
         if in_t + read_t + write_t > threshold:
             mult *= m
 
-    cost = (
-        in_t * p_in
-        + out_t * p_out
-        + read_t * p_read
-        + w5m * p_in * CACHE_WRITE_5M_MULTIPLIER
-        + w1h * p_in * CACHE_WRITE_1H_MULTIPLIER
-    ) / 1_000_000
-    return cost * mult
+    scale = mult / 1_000_000
+    return {
+        "input": in_t * p_in * scale,
+        "output": out_t * p_out * scale,
+        "cache_write": (w5m * CACHE_WRITE_5M_MULTIPLIER
+                        + w1h * CACHE_WRITE_1H_MULTIPLIER) * p_in * scale,
+        "cache_read": read_t * p_read * scale,
+    }
 
 
 def update_usage_stats(stats: dict, model: str, usage: dict) -> None:
@@ -153,7 +161,7 @@ def update_usage_stats(stats: dict, model: str, usage: dict) -> None:
         "output_tokens": 0,
         "cache_creation_input_tokens": 0,
         "cache_read_input_tokens": 0,
-        "cost": 0.0,
+        "cost": dict.fromkeys(COST_KEYS, 0.0),  # 種別ごとの USD
         "unpriced_turns": 0,  # 単価不明で cost に含められなかったターン数
     })
     rec["turns"] += 1
@@ -167,7 +175,8 @@ def update_usage_stats(stats: dict, model: str, usage: dict) -> None:
     if cost is None:
         rec["unpriced_turns"] += 1
     else:
-        rec["cost"] += cost
+        for k in COST_KEYS:
+            rec["cost"][k] += cost[k]
 
 
 def render_content(content, include_tools: bool = True) -> str:
@@ -473,11 +482,16 @@ def convert_jsonl_to_md(jsonl_path: Path, output_path: Path = None,
                 cw_t = usage.get("cache_creation_input_tokens")
                 cr_t = usage.get("cache_read_input_tokens")
                 if isinstance(cw_t, int):
-                    tok_str += f"/cache_w={cw_t}"
+                    tok_str += f"/cache_w={cw_t:,}"
                 if isinstance(cr_t, int):
-                    tok_str += f"/cache_r={cr_t}"
+                    tok_str += f"/cache_r={cr_t:,}"
                 if tok_str and not tok_str.startswith(" · "):
                     tok_str = " · " + tok_str.lstrip("/")
+                # コンテキストサイズ = このリクエストでモデルに渡した入力全体
+                # (キャッシュ未使用分 + キャッシュ書き込み分 + キャッシュ読み込み分)
+                ctx_parts = [t for t in (in_t, cw_t, cr_t) if isinstance(t, int)]
+                if ctx_parts:
+                    tok_str = f" · ctx={sum(ctx_parts):,}" + tok_str
                 sections.append(
                     f"## 🤖 Assistant ({short}){tok_str} — {ts_str}\n\n{rendered}\n"
                 )
@@ -503,15 +517,30 @@ def convert_jsonl_to_md(jsonl_path: Path, output_path: Path = None,
     # モデル使用サマリ
     if model_stats:
         header_lines.append("")
+        # ターン数の多い順にソート
+        rows = sorted(model_stats.items(), key=lambda x: -x[1]["turns"])
+        total_turns = sum(r["turns"] for r in model_stats.values())
+        total_unpriced = sum(r["unpriced_turns"] for r in model_stats.values())
+
+        # --- トークン使用量(ログの値そのまま) ---
+        token_keys = ("input_tokens", "output_tokens",
+                      "cache_creation_input_tokens", "cache_read_input_tokens")
         header_lines.append("## Model Usage Summary")
         header_lines.append("")
         header_lines.append(
-            "| Model | Turns | Input | Output | Cache create | Cache read | Cost (USD) |"
+            "| Model | Turns | Input | Output | Cache write | Cache read |"
         )
-        header_lines.append(
-            "|---|---:|---:|---:|---:|---:|---:|"
-        )
+        header_lines.append("|---|---:|---:|---:|---:|---:|")
+        for model, rec in rows:
+            cells = " | ".join(f"{rec[k]:,}" for k in token_keys)
+            header_lines.append(
+                f"| `{shorten_model_name(model)}` | {rec['turns']:,} | {cells} |"
+            )
+        totals = {k: sum(r[k] for r in model_stats.values()) for k in token_keys}
+        cells = " | ".join(f"**{totals[k]:,}**" for k in token_keys)
+        header_lines.append(f"| **Total** | **{total_turns:,}** | {cells} |")
 
+        # --- 推定コスト(API 単価換算) ---
         def fmt_cost(cost: float, turns: int, unpriced: int) -> str:
             # 全ターン単価不明なら "—"、一部不明なら下限値であることを示す
             if turns and unpriced == turns:
@@ -519,39 +548,36 @@ def convert_jsonl_to_md(jsonl_path: Path, output_path: Path = None,
             s = f"${cost:,.2f}"
             return f"≥{s}" if unpriced else s
 
-        # ターン数の多い順にソート
-        for model, rec in sorted(model_stats.items(),
-                                 key=lambda x: -x[1]["turns"]):
-            short = shorten_model_name(model)
-            header_lines.append(
-                f"| `{short}` | {rec['turns']} "
-                f"| {rec['input_tokens']:,} "
-                f"| {rec['output_tokens']:,} "
-                f"| {rec['cache_creation_input_tokens']:,} "
-                f"| {rec['cache_read_input_tokens']:,} "
-                f"| {fmt_cost(rec['cost'], rec['turns'], rec['unpriced_turns'])} |"
-            )
-        # 合計行
-        total_turns = sum(r["turns"] for r in model_stats.values())
-        total_in = sum(r["input_tokens"] for r in model_stats.values())
-        total_out = sum(r["output_tokens"] for r in model_stats.values())
-        total_cc = sum(r["cache_creation_input_tokens"] for r in model_stats.values())
-        total_cr = sum(r["cache_read_input_tokens"] for r in model_stats.values())
-        total_cost = sum(r["cost"] for r in model_stats.values())
-        total_unpriced = sum(r["unpriced_turns"] for r in model_stats.values())
+        def cost_cells(costs: dict, turns: int, unpriced: int, bold=False) -> str:
+            vals = [costs[k] for k in COST_KEYS] + [sum(costs.values())]
+            b = "**" if bold else ""
+            return " | ".join(f"{b}{fmt_cost(v, turns, unpriced)}{b}" for v in vals)
+
+        header_lines.append("")
+        header_lines.append("## Estimated Cost (USD)")
+        header_lines.append("")
         header_lines.append(
-            f"| **Total** | **{total_turns}** "
-            f"| **{total_in:,}** | **{total_out:,}** "
-            f"| **{total_cc:,}** | **{total_cr:,}** "
-            f"| **{fmt_cost(total_cost, total_turns, total_unpriced)}** |"
+            "| Model | Input | Output | Cache write | Cache read | Total |"
+        )
+        header_lines.append("|---|---:|---:|---:|---:|---:|")
+        for model, rec in rows:
+            header_lines.append(
+                f"| `{shorten_model_name(model)}` "
+                f"| {cost_cells(rec['cost'], rec['turns'], rec['unpriced_turns'])} |"
+            )
+        total_costs = {k: sum(r["cost"][k] for r in model_stats.values())
+                       for k in COST_KEYS}
+        header_lines.append(
+            f"| **Total** "
+            f"| {cost_cells(total_costs, total_turns, total_unpriced, bold=True)} |"
         )
         header_lines.append("")
         header_lines.append(
-            "> Cost は API 単価で換算した推定値です(Pro/Max 等のサブスクリプション利用時の実請求額ではありません)。"
+            "> API 単価で換算した推定値です(Pro/Max 等のサブスクリプション利用時の実請求額ではありません)。"
         )
         if total_unpriced:
             header_lines.append(
-                f"> 単価表に無いモデル/モードの {total_unpriced} ターンは Cost に含まれていません(`≥` / `—`)。"
+                f"> 単価表に無いモデル/モードの {total_unpriced:,} ターンはコストに含まれていません(`≥` / `—`)。"
             )
 
     header_lines.extend(["", "---", ""])

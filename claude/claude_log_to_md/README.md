@@ -30,15 +30,16 @@ Windows のコンソール (cp932) では完了メッセージの `✓` で `Uni
 ### ヘッダ
 
 - Session ID、元ファイル、開始時刻、メッセージ数、作業ディレクトリ、Git ブランチ
-- **Model Usage Summary**: モデル別のターン数・トークン数・推定コスト
+- **Model Usage Summary**: モデル別のトークン使用量(ログの値そのまま)
 
 | 列 | 内容 |
 |---|---|
 | Turns | API 応答数(`message.id` 単位) |
 | Input / Output | 入力 / 出力トークン |
-| Cache create | キャッシュ書き込みトークン |
+| Cache write | キャッシュ書き込みトークン |
 | Cache read | キャッシュ読み込みトークン |
-| Cost (USD) | API 単価で換算した推定コスト |
+
+- **Estimated Cost (USD)**: 上記トークンを API 単価で換算した推定コスト。Input / Output / Cache write / Cache read の内訳と Total を表示(→ [コスト計算](#コスト計算))
 
 Claude Code は 1 つの API 応答を content ブロックごとに複数行へ分けて記録し、各行に同じ `usage` を書く。集計は `message.id` ごとに 1 回だけ行うため、重複して数えることはない。`--no-tools` の有無でも集計値は変わらない。
 
@@ -49,7 +50,7 @@ Claude Code は 1 つの API 応答を content ブロックごとに複数行へ
 | 見出し | 内容 |
 |---|---|
 | 🧑 UserPrompt | ユーザーの入力 |
-| 🤖 Assistant (model) · in/out/cache_w/cache_r | Claude の応答。トークン数を併記(キャッシュ値は元データにある場合のみ) |
+| 🤖 Assistant (model) · ctx · in/out/cache_w/cache_r | Claude の応答。コンテキストサイズとトークン数を併記(キャッシュ値は元データにある場合のみ) |
 | 📤 Tool Result | ツール実行結果(長い結果は 2000 文字で省略) |
 | 📋 SessionContinuation | auto-compact 等による会話継続のサマリ |
 | ⚡ SlashCommand / 💻 LocalCommand* | スラッシュコマンドやローカルコマンドの入出力 |
@@ -57,9 +58,11 @@ Claude Code は 1 つの API 応答を content ブロックごとに複数行へ
 
 Thinking とツール結果は `<details>` で折りたたまれる。
 
+`ctx` はその時点のコンテキストサイズで、そのリクエストでモデルに渡した入力トークンの合計 (`input_tokens + cache_creation_input_tokens + cache_read_input_tokens`)。auto-compact が起きると大きく減る。
+
 ## コスト計算
 
-`Cost (USD)` は Anthropic API の公開単価で換算した **推定値**。Pro / Max などのサブスクリプション利用時の実請求額ではない。
+`Estimated Cost (USD)` は Anthropic API の公開単価で換算した **推定値**。Pro / Max などのサブスクリプション利用時の実請求額ではない。
 
 - 単価はスクリプト内の `MODEL_PRICING`(USD / 100 万トークン、2026-10 時点)
 - キャッシュ書き込み: 入力単価 × 1.25 (TTL 5 分) / × 2 (TTL 1 時間)。ログの `usage.cache_creation` の TTL 別内訳を使い、内訳がない場合は 5 分とみなす
